@@ -1,9 +1,12 @@
 use assert_cmd::cargo::cargo_bin;
 
+fn get_staking_miner_name() -> &'static str {
+	env!("CARGO_PKG_NAME")
+}
+
 #[test]
 fn cli_version_works() {
-	let crate_name = env!("CARGO_PKG_NAME");
-	let output = assert_cmd::Command::new(cargo_bin(crate_name))
+	let output = assert_cmd::Command::new(cargo_bin(get_staking_miner_name()))
 		.arg("--version")
 		.output()
 		.unwrap();
@@ -11,11 +14,11 @@ fn cli_version_works() {
 	assert!(output.status.success(), "command returned with non-success exit code");
 	let version = String::from_utf8_lossy(&output.stdout).trim().to_owned();
 
-	assert_eq!(version, format!("{} {}", crate_name, env!("CARGO_PKG_VERSION")));
+	assert_eq!(version, format!("{} {}", get_staking_miner_name(), env!("CARGO_PKG_VERSION")));
 }
 
 /// Requires a `polkadot` binary to in the path to run integration tests against.
-#[cfg(feature = "slow-tests")]
+//#[cfg(feature = "slow-tests")]
 mod slow_tests {
 	use super::*;
 	use std::{
@@ -43,7 +46,36 @@ mod slow_tests {
 		test_dry_run("westend-dev");
 	}
 
-	fn test_dry_run(chain: &str) {
+	#[test]
+	fn polkadot_monitor_works() {
+		let _ = tracing_subscriber::fmt()
+			.with_env_filter(EnvFilter::from_default_env())
+			.try_init();
+
+		let (_cmd, ws_url) = run_polkadot_node_on_chain("polkadot-dev");
+
+		let mut s_cmd = KillChildOnDrop(
+			process::Command::new(get_staking_miner_name())
+				.stdout(process::Stdio::piped())
+				.stderr(process::Stdio::piped())
+				.args(&[
+					"--uri",
+					"ws://127.0.0.1:9944",
+					"--seed-or-path",
+					"//Alice",
+					"monitor",
+					"seq-phragmen",
+				])
+				.spawn()
+				.unwrap(),
+		);
+
+		let stderr = s_cmd.stderr.take().unwrap();
+
+		find_mined_solution(stderr).unwrap();
+	}
+
+	fn run_polkadot_node_on_chain(chain: &str) -> (KillChildOnDrop, String) {
 		let mut cmd = KillChildOnDrop(
 			process::Command::new("polkadot")
 				.stdout(process::Stdio::piped())
@@ -65,15 +97,20 @@ mod slow_tests {
 
 		let (ws_url, _) = find_ws_url_from_output(stderr);
 
+		(cmd, ws_url)
+	}
+
+	fn test_dry_run(chain: &str) {
 		let crate_name = env!("CARGO_PKG_NAME");
+
+		let (_cmd, ws_url) = run_polkadot_node_on_chain(chain);
+
 		let output = assert_cmd::Command::new(cargo_bin(crate_name))
 			.args(&["--uri", &ws_url, "--seed-or-path", "//Alice", "dry-run", "seq-phragmen"])
 			.output()
 			.unwrap();
 
-		let sterr = String::from_utf8(output.stdout).unwrap();
-
-		println!("output: {}", sterr);
+		println!("output: {}", String::from_utf8(output.stdout).unwrap());
 		assert!(output.status.success());
 	}
 
@@ -104,6 +141,31 @@ mod slow_tests {
 			.expect("We should get a WebSocket address");
 
 		(ws_url, data)
+	}
+
+	fn find_mined_solution(read: impl Read + Send) -> Result<(), String> {
+		let now = std::time::Instant::now();
+		const MAX_WAIT: u64 = 15 * 60;
+
+		let mut lines = String::new();
+
+		for line in BufReader::new(read).lines() {
+			let line = line.map_err(|e| e.to_string())?;
+
+			log::info!("{}", line);
+
+			lines.push_str(&line);
+
+			if now.elapsed().as_secs() > MAX_WAIT {
+				return Err("Max wait time exceeded for a solution to complete".to_string())
+			}
+
+			if line.contains("Included at") || line.contains("Finalized at") {
+				return Ok(())
+			}
+		}
+
+		Err(format!("All output consumed; previous data: {}", lines))
 	}
 
 	pub struct KillChildOnDrop(pub Child);
